@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 把 LongShot 发布到 GitHub：构建 → 打包 → 提交 → 推送 → 发 Release，一条命令走完。
 
@@ -63,7 +63,10 @@ try {
     Write-Host "==> 提交源码" -ForegroundColor Cyan
     if (-not (Test-Path "$projectRoot\.git")) { git init | Out-Null }
     git add -A
-    git diff --cached --quiet || git commit -m "LongShot $Tag"
+    # 这里绝不能用 pwsh 7 的 `||`：Windows PowerShell 5.1（双击 .ps1 时的默认引擎）
+    # 会直接报「标记 || 不是此版本中的有效语句分隔符」，整个脚本一行都执行不了。
+    git diff --cached --quiet
+    if ($LASTEXITCODE -ne 0) { git commit -m "LongShot $Tag" }
 
     $remoteUrl = "https://github.com/$Repo.git"
     $remotes = git remote 2>$null
@@ -73,6 +76,11 @@ try {
     $branch = (git rev-parse --abbrev-ref HEAD).Trim()
     Write-Host "==> 推送 $branch → $remoteUrl" -ForegroundColor Cyan
     git push -u origin $branch
+    # 原生命令的非零退出码不会触发 $ErrorActionPreference='Stop'，必须自己查；
+    # 否则推送失败会一路静默走下去，用户还以为发布成功了。
+    if ($LASTEXITCODE -ne 0) {
+        throw "推送失败（退出码 $LASTEXITCODE）。请确认本机能访问 github.com，且 git 凭据有效。"
+    }
 
     if ($SkipRelease) { return }
 
