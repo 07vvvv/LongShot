@@ -1,20 +1,23 @@
 <#
 .SYNOPSIS
-把 LongShot 发布到 GitHub。**请在你自己的终端里运行**（见下方说明）。
+把 LongShot 发布到 GitHub：构建 → 打包 → 提交 → 推送 → 发 Release，一条命令走完。
 
 .DESCRIPTION
-DSH 沙箱阻断了 TLS 出网（连 https://www.microsoft.com 都是 SEC_E_NO_CREDENTIALS），
-所以推送这一步无法代跑。这个脚本把构建、打包、打标签、推仓库、发 Release 串成一条命令。
+产物布局：
+  - 源码进仓库（bin / obj / publish / zip / 启动日志都在 .gitignore 里）
+  - Release 附件 = LongShot-<Tag>-win-x64.zip（里面只有 exe）+ 同名 .sha256
 
 首次使用：
   1. 先在 GitHub 网页上建一个**空仓库**（不要勾 README / .gitignore / license）
   2. 在仓库目录里执行：
        .\upload-to-github.ps1 -Repo 你的用户名/LongShot -Tag v1.0.0
 
-后续发版：
+后续发版（Tag 已存在的会改为覆盖附件，不会重复建 Release）：
        .\upload-to-github.ps1 -Repo 你的用户名/LongShot -Tag v1.0.1
 
 没有 gh CLI 也能用：脚本会推源码，然后告诉你去哪儿手动传附件。
+
+若 push 失败，先确认本机能正常访问 github.com——公司代理或防火墙常拦这一跳。
 #>
 param(
     [Parameter(Mandatory = $true)][string]$Repo,     # 例如 07vvvv/LongShot
@@ -50,7 +53,8 @@ try {
     $zip = Join-Path $projectRoot "LongShot-$Tag-win-x64.zip"
     Write-Host "==> 打包 $zip" -ForegroundColor Cyan
     Remove-Item $zip -ErrorAction SilentlyContinue
-    Compress-Archive -Path $exe, (Join-Path $projectRoot "README.md") -DestinationPath $zip -Force
+    # 只放 exe：README 在仓库页面和 Release 说明里都看得到，压缩包里不必再塞一份
+    Compress-Archive -Path $exe -DestinationPath $zip -Force
 
     $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
     "$hash  LongShot-$Tag-win-x64.zip" | Set-Content "$zip.sha256" -Encoding ascii
@@ -73,8 +77,19 @@ try {
     if ($SkipRelease) { return }
 
     if ($hasGh) {
-        Write-Host "==> 创建 Release $Tag" -ForegroundColor Cyan
-        gh release create $Tag $zip "$zip.sha256" --repo $Repo --title "LongShot $Tag" --generate-notes
+        # Tag 已存在时 create 会直接报错，所以先探一下：存在就只覆盖附件，
+        # 并且**不动**已经写好的 Release 说明（--generate-notes 会把它冲掉）。
+        gh release view $Tag --repo $Repo *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "==> Release $Tag 已存在，覆盖附件" -ForegroundColor Cyan
+            gh release upload $Tag $zip "$zip.sha256" --repo $Repo --clobber
+        }
+        else {
+            Write-Host "==> 创建 Release $Tag" -ForegroundColor Cyan
+            gh release create $Tag $zip "$zip.sha256" --repo $Repo --title "LongShot $Tag" --generate-notes
+        }
+
+        if ($LASTEXITCODE -ne 0) { throw "Release 处理失败（退出码 $LASTEXITCODE）" }
         Write-Host "完成：https://github.com/$Repo/releases/tag/$Tag" -ForegroundColor Green
     }
     else {
