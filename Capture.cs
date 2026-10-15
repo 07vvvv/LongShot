@@ -252,6 +252,18 @@ public static class FrameStitcher
     /// <summary>粗搜后取前 K 个候选分别精修。</summary>
     private const int CoarseTopK = 5;
 
+    /// <summary>逐行平均灰度差超过它才算「这一行动了」；低于它就是固定 UI 或纯色背景。</summary>
+    private const double MovingThreshold = 2.0;
+
+    /// <summary>打平时「接近参考位移」的次级权重：0.001 约等于「差 1 行」的分数代价。</summary>
+    private const double TieBreakerWeight = 1e-3;
+
+    /// <summary>分数与最优相差在这个带内就算并列，需要用更细的采样把它们区分开。</summary>
+    private const double CoarseRefineBand = 0.5;
+
+    /// <summary>并列最优的候选最多复筛这么多个，防止病态内容把配准拖慢。</summary>
+    private const int CoarseRefineMax = 96;
+
     /// <summary>
     /// 重叠区至少要有多高才算有效候选。太小的话样本太少，无纹理内容也能「碰巧匹配」，
     /// 会把一次大幅滚动误判成小重叠下的完美匹配，中间内容整段丢失。
@@ -268,7 +280,8 @@ public static class FrameStitcher
     /// 周期性伪峰冒充答案，往长图里塞进错位内容。实测全范围搜索 800×900 只要 ~30ms，
     /// 换来的是这类错误整类消失。
     /// </summary>
-    public static bool TryEstimateOffset(ScreenFrame prev, ScreenFrame next, out int dh, out double score)
+    public static bool TryEstimateOffset(
+        ScreenFrame prev, ScreenFrame next, out int dh, out double score, int hint = 0)
     {
         dh = 0;
         score = double.MaxValue;
@@ -279,7 +292,8 @@ public static class FrameStitcher
 
         // 画面几乎没动 = 用户没在滚。必须先判这一条：候选范围排除了 0，
         // 否则「完全没滚动」会被匹配成「滚了几像素」，每次都往长图里塞重复内容。
-        var still = NormalizedSad(prev.Gray, next.Gray, w, h, 0, 4);
+        // 这一条还必须用**全行**：画面真的没动时，下面每个行都会被判成「不动」，一个样本都不剩。
+        var still = NormalizedSad(prev.Gray, next.Gray, w, h, 0, 4, null);
         if (still <= StillThreshold)
         {
             dh = 0;
@@ -287,15 +301,85 @@ public static class FrameStitcher
             return true;
         }
 
+        // 固定 UI（输入框、工具栏、状态栏、滚动条）在哪个候选上都贡献同样的差分，
+        // 只会把正确候选的分数一起抬过信任阈值，必须先剔掉再比。
+        var moving = MovingRows(prev.Gray, next.Gray, w, h);
+        var movable = 0;
+        foreach (var m in moving)
+        {
+            if (m) movable++;
+        }
+
+        if (movable < h / 16) return false;     // 可辨内容太少，配准没有意义
+
         var limit = h - MinOverlapFor(h) - 1;
         if (limit < 4) return false;
 
-        var (found, best, bestScore) = Search(prev.Gray, next.Gray, w, h, -limit, limit);
-        if (!found || bestScore > TrustThreshold) return false;
+        var (found, best, bestScore) = Search(prev.Gray, next.Gray, w, h, -limit, limit, moving, hint);
+        if (!found || bestScore > TrustThreshold)
+        {
+            score = bestScore;      // 回填真实分数，别让调用方和日志看到初始的 MaxValue
+            return false;
+        }
 
         dh = best;
         score = bestScore;
         return true;
+    }
+
+    /// <summary>
+    /// 连续这么多行都不动，才算「固定 UI 区块」（输入框、工具栏、状态栏）。比它短的不变段
+    /// ——正文里的空白、内容恰好对齐的行——照常参与配准：把它们一并剔掉，稀疏内容下剩下没几行，
+    /// 错误候选反而能拿满分（实测「每 12 行一条文字带」明显不如旧版，就是栽在这里）。
+    /// </summary>
+    private static int FixedRunFor(int h) => Math.Max(20, h / 32);
+
+    /// <summary>
+    /// 挑出「不随滚动移动的行」：固定输入框、工具栏、状态栏、滚动条，以及成片不变的背景。
+    /// 它们在每个候选偏移上都贡献同样大的差分，只会把正确候选的分数一起抬高——实测固定 UI 占
+    /// 帧高两成时，正确候选的分数从 0 被抬到 20 以上，越过信任阈值，于是每一帧都被判成「配不上」，
+    /// 长图就停在首帧（本项目最初正是这样把后面全部内容丢掉的）。
+    /// 配准只该看真正随滚动移动的内容。
+    /// </summary>
+    private static bool[] MovingRows(byte[] prev, byte[] next, int w, int h)
+    {
+        var changed = new bool[h];
+        var step = w > 512 ? 4 : 2;     // 这一步只是分类，抽样足够，不参与打分
+
+        for (var y = 0; y < h; y++)
+        {
+            var p = y * w;
+            long sum = 0;
+            var samples = 0;
+            for (var x = 0; x < w; x += step)
+            {
+                sum += Math.Abs(prev[p + x] - next[p + x]);
+                samples++;
+            }
+
+            changed[y] = samples > 0 && (double)sum / samples > MovingThreshold;
+        }
+
+        var moving = new bool[h];
+        var fixedRun = FixedRunFor(h);
+
+        for (var y = 0; y < h;)
+        {
+            if (changed[y])
+            {
+                moving[y] = true;
+                y++;
+                continue;
+            }
+
+            var start = y;
+            while (y < h && !changed[y]) y++;
+
+            var isFixedBlock = y - start >= fixedRun;
+            for (var k = start; k < y; k++) moving[k] = !isFixedBlock;
+        }
+
+        return moving;
     }
 
     /// <summary>
@@ -305,19 +389,32 @@ public static class FrameStitcher
     /// 网格上的周期性伪峰会赢，而精修范围又够不到真值。
     /// </summary>
     private static (bool Found, int Dh, double Score) Search(
-        byte[] prev, byte[] next, int w, int h, int min, int max)
+        byte[] prev, byte[] next, int w, int h, int min, int max, bool[] moving, int hint)
     {
         var coarse = new List<(int Dh, double Score)>(max - min + 1);
 
         for (var candidate = min; candidate <= max; candidate++)
         {
             if (Math.Abs(candidate) < 4) continue;      // 太小的位移不可信，等同静止
-            coarse.Add((candidate, NormalizedSad(prev, next, w, h, candidate, 8)));
+            coarse.Add((candidate, NormalizedSad(prev, next, w, h, candidate, 8, moving)));
         }
 
         if (coarse.Count == 0) return (false, 0, double.MaxValue);
 
-        coarse.Sort((a, b) => a.Score.CompareTo(b.Score));
+        SortCoarse(coarse, hint);
+
+        // 粗搜的 step=8 采样碰上「行高是 8 的倍数」的内容（每 16 行一条横线的表格、代码行），
+        // 采样点与内容同频，一堆候选会拿到一模一样的分数，正确的那个被埋在并列里、进不了精修范围。
+        // 对并列最优的那一小撮再用 step=4 复算一遍，并列就散开了；常规内容几乎没有并列，
+        // 这一趟基本是白跑，所以代价是自适应的。
+        var gate = coarse[0].Score + CoarseRefineBand;
+        for (var i = 0; i < coarse.Count && i < CoarseRefineMax; i++)
+        {
+            if (coarse[i].Score > gate) continue;   // 排序键里含次级权重，分数并不单调，不能提前收工
+            coarse[i] = (coarse[i].Dh, NormalizedSad(prev, next, w, h, coarse[i].Dh, 4, moving));
+        }
+
+        SortCoarse(coarse, hint);
 
         var best = 0;
         var bestScore = double.MaxValue;
@@ -329,7 +426,7 @@ public static class FrameStitcher
             for (var candidate = lo; candidate <= hi; candidate++)
             {
                 if (Math.Abs(candidate) < 4) continue;
-                var s = NormalizedSad(prev, next, w, h, candidate, 1);
+                var s = NormalizedSad(prev, next, w, h, candidate, 1, moving);
                 if (s < bestScore)
                 {
                     bestScore = s;
@@ -342,10 +439,33 @@ public static class FrameStitcher
     }
 
     /// <summary>
+    /// 给粗搜候选排序。单键：分数为主，「离参考位移的距离」只作为极小的次级权重——内容有周期性
+    /// （聊天卡片、列表、表格、代码行）时，差一个周期的候选分数完全一样，正是这个次级权重把它们
+    /// 区分开。参考位移为 0（首帧、刚重设过基准、还没有「上一步」可言）时退化成「偏好位移最小」，
+    /// 这是代价最小的假设：几个等价候选里选最小的那个，实测往长图里写重复内容的行数少一个量级。
+    ///
+    /// 刻意不用「分数差在某个范围内就换另一个键比」的双键比较器：那种比较不传递
+    /// （a&lt;b、b&lt;c、c&lt;a 可以同时成立），.NET 的 List.Sort 会排出自相矛盾的结果，
+    /// 前 K 个精修种子随之不可信。
+    /// </summary>
+    private static void SortCoarse(List<(int Dh, double Score)> coarse, int hint) =>
+        coarse.Sort((a, b) => SortKey(a, hint).CompareTo(SortKey(b, hint)));
+
+    private static double SortKey((int Dh, double Score) candidate, int hint)
+    {
+        var distance = hint == 0 ? Math.Abs(candidate.Dh) : Math.Abs(candidate.Dh - hint);
+        return candidate.Score + TieBreakerWeight * Math.Min(distance, 1000);
+    }
+
+    /// <summary>
     /// 归一化 SAD：不同候选 dh 的重叠区长度不同，不归一化的话「重叠越少分越低」，
     /// 结果会系统性地偏向大偏移。这是这个算法最容易写错的地方。
+    ///
+    /// moving 用来把「不随滚动移动的行」排除在外（固定 UI、纯色背景）：它们跟哪个候选都比不出
+    /// 结果，留在分母里只会稀释信号。传 null 表示全行都算。
     /// </summary>
-    private static double NormalizedSad(byte[] prev, byte[] next, int w, int h, int dh, int step)
+    private static double NormalizedSad(
+        byte[] prev, byte[] next, int w, int h, int dh, int step, bool[]? moving)
     {
         var shift = Math.Abs(dh);
         var overlap = h - shift;
@@ -361,6 +481,9 @@ public static class FrameStitcher
 
         for (var y = 0; y < overlap; y += step)
         {
+            // 任一侧落在「不动的行」上，这一行比较的就是两个不相干的东西，只能污染分数
+            if (moving is not null && (!moving[y + prevShift] || !moving[y + nextShift])) continue;
+
             var p = (y + prevShift) * w;
             var n = (y + nextShift) * w;
             for (var x = 0; x < w; x += step)

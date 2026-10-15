@@ -21,3 +21,9 @@ pathtest.png
 # 发布压缩包走 Release 附件，不进仓库
 *.zip
 *.sha256
+
+# 解压出来试用的目录（里面是一个 49MB 的 exe，别提交）
+LongShot-v*/
+
+# 修配准那次留下的一次性验证脚本与产物（里面有用户截图，不进公开仓库）
+_analysis/

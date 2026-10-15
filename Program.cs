@@ -932,6 +932,63 @@ internal static class StitchTestRunner
             if (good) pass++;
         }
 
+        {
+            // 选区里含固定 UI（输入框 / 工具栏 / 状态栏）：这些行不随滚动移动，在任何候选偏移下
+            // 都贡献同样大的差分，会把正确候选的分数抬过信任阈值，让配准全线失败、长图只剩首帧。
+            total++;
+            var page = FakePage(200, 1400);
+            var ui = FakePage(200, 80);
+            var prev = WithFixedBottom(Slice(page, 0, 300), ui, 60);
+            var next = WithFixedBottom(Slice(page, 140, 300), ui, 60);
+            var ok = FrameStitcher.TryEstimateOffset(prev, next, out var got, out var score) && got == 140;
+            Console.WriteLine($"  [固定 UI ] 底部 20% 不随滚动移动　期望 dh= 140　实测 dh={got,4}　score={score,6:F2}　{(ok ? "PASS" : "FAIL")}");
+            if (ok) pass++;
+        }
+
+        {
+            // 内容周期性（聊天卡片 / 列表 / 表格行）：差一个周期的候选分数完全一样，
+            // 不按「与上一步位移接近」裁决就会选错，长图里就是整段内容重复覆盖。
+            total++;
+            var page = Tile(FakePage(200, 150), 8);      // 周期 150 行
+            var prev = Slice(page, 0, 300);
+            var next = Slice(page, 100, 300);            // 真值 +100，等价伪峰 -50 / +250
+            var down = FrameStitcher.TryEstimateOffset(prev, next, out var gotDown, out _, 100) && gotDown == 100;
+            var up = FrameStitcher.TryEstimateOffset(prev, next, out var gotUp, out _, -50) && gotUp == -50;
+            Console.WriteLine($"  [周期内容] hint=+100 得 {gotDown,4}　hint= -50 得 {gotUp,4}　{(down && up ? "PASS" : "FAIL")}");
+            if (down && up) pass++;
+        }
+
+        {
+            // 行结构内容（每 gap 行只有 2 行文字带，带内逐像素随机、每带都不同）：粗搜 step=8 的
+            // 采样行会整条落在白底上，冒出一大批假并列（分数全是 0），真值被埋在并列里、
+            // 进不了精修范围。这正是「并列候选再用 step=4 复算一遍」专门修的场景，
+            // 2/16 就是当初出错的那一档，所以两档都要盯住。
+            foreach (var gap in new[] { 12, 16 })
+            {
+                total++;
+                var page = SparsePage(200, 2200, gap);
+                var prev = Slice(page, 400, 300);
+                var next = Slice(page, 500, 300);
+                var ok = FrameStitcher.TryEstimateOffset(prev, next, out var got, out var score) && got == 100;
+                Console.WriteLine($"  [行结构  ] 每 {gap,2} 行 2 行文字带　期望 dh= 100　实测 dh={got,4}　score={score,6:F2}　{(ok ? "PASS" : "FAIL")}");
+                if (ok) pass++;
+            }
+        }
+
+        {
+            // 严格周期内容 + 没有上一步位移（首帧、或刚重设过基准）：差一个周期的候选在数学上
+            // 完全等价，任何算法都分辨不了——所以这里只要求「给出的是一个内容真的对得上的位移」，
+            // 不要求它恰好等于真值。
+            total++;
+            var card = FakePage(200, 150);
+            var page = Tile(card, 8);
+            var prev = Slice(page, 0, 300);
+            var next = Slice(page, 100, 300);
+            var ok = FrameStitcher.TryEstimateOffset(prev, next, out var got, out var score, 0) && score <= 1.0;
+            Console.WriteLine($"  [无先验  ] 周期 150、不给上一步位移　实测 dh={got,4}　score={score,6:F2}　对得上={score <= 1.0}　{(ok ? "PASS" : "FAIL")}");
+            if (ok) pass++;
+        }
+
         Console.WriteLine();
         Console.WriteLine(pass == total
             ? $"全部通过：{pass}/{total}"
@@ -976,6 +1033,61 @@ internal static class StitchTestRunner
         Array.Copy(page.Pixels, top * w, pixels, 0, w * height);
 
         return new ScreenFrame { Width = w, Height = height, Gray = gray, Pixels = pixels };
+    }
+
+    /// <summary>把帧底部 rows 行换成「不随滚动移动」的固定内容，模拟选区包含输入框 / 工具栏。</summary>
+    private static ScreenFrame WithFixedBottom(ScreenFrame frame, ScreenFrame fixedContent, int rows)
+    {
+        var w = frame.Width;
+        var gray = (byte[])frame.Gray.Clone();
+        var pixels = (int[])frame.Pixels.Clone();
+
+        Array.Copy(fixedContent.Gray, 0, gray, (frame.Height - rows) * w, rows * w);
+        Array.Copy(fixedContent.Pixels, 0, pixels, (frame.Height - rows) * w, rows * w);
+
+        return new ScreenFrame { Width = w, Height = frame.Height, Gray = gray, Pixels = pixels };
+    }
+
+    /// <summary>
+    /// 造一张「行结构」页面：每 gap 行只有 2 行有文字，其余是接近白底（245）的背景。
+    /// 文字带里逐像素二值随机、每条带都不同，模拟真实文本行——不能是整行纯色，
+    /// 否则不会出现「粗搜采样行整条落在白底上」的假并列。
+    /// </summary>
+    private static ScreenFrame SparsePage(int w, int h, int gap)
+    {
+        var pixels = new int[w * h];
+        var gray = new byte[w * h];
+        var rnd = new Random(11);
+
+        for (var y = 0; y < h; y++)
+        {
+            var textBand = y % gap < 2;
+            for (var x = 0; x < w; x++)
+            {
+                var v = textBand ? (byte)(rnd.Next(2) == 0 ? 30 : 210) : (byte)245;
+                gray[y * w + x] = v;
+                pixels[y * w + x] = unchecked((int)0xFF000000 | (v << 16) | (v << 8) | v);
+            }
+        }
+
+        return new ScreenFrame { Width = w, Height = h, Gray = gray, Pixels = pixels };
+    }
+
+    /// <summary>把一张卡片纵向重复 count 次，模拟内容周期性（聊天卡片 / 列表 / 表格行）。</summary>
+    private static ScreenFrame Tile(ScreenFrame card, int count)
+    {
+        var w = card.Width;
+        var block = card.Height * w;
+        var gray = new byte[block * count];
+        var pixels = new int[block * count];
+
+        for (var i = 0; i < count; i++)
+        {
+            Array.Copy(card.Gray, 0, gray, i * block, block);
+            Array.Copy(card.Pixels, 0, pixels, i * block, block);
+        }
+
+        return new ScreenFrame { Width = w, Height = card.Height * count, Gray = gray, Pixels = pixels };
     }
 }
 

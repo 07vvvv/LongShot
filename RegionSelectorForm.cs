@@ -45,6 +45,9 @@ public sealed class RegionSelectorForm : Form
     private int _skipped;
     private int _missStreak;
 
+    /// <summary>上一步的位移，作为配准打平时的裁决依据（内容有周期性时只有它能分辨真假峰）。</summary>
+    private int _lastDh;
+
     public RegionSelectorForm()
     {
         FormBorderStyle = FormBorderStyle.None;
@@ -271,9 +274,13 @@ public sealed class RegionSelectorForm : Form
         {
             GrabOnceCore();
         }
-        catch
+        catch (Exception ex)
         {
-            // 抓帧或配准出任何意外，都不该让异常从定时器抛进消息循环——那会直接把程序崩掉
+            // 抓帧或配准出任何意外，都不该让异常从定时器抛进消息循环——那会直接把程序崩掉。
+            // 但也不能一声不吭：留下日志，否则用户看到的是「卡住」，而现场什么都没有。
+            _skipped++;
+            StartLog.Write($"抓帧失败，已跳过一帧：{ex.GetType().Name} {ex.Message}");
+            UpdateHud();
         }
     }
 
@@ -311,7 +318,7 @@ public sealed class RegionSelectorForm : Form
             return;
         }
 
-        if (!FrameStitcher.TryEstimateOffset(_previous, frame, out var dh, out _))
+        if (!FrameStitcher.TryEstimateOffset(_previous, frame, out var dh, out _, _lastDh))
         {
             // 基准失效时不能顺手把当前帧当成新基准：累积器的游标还停在旧位置，
             // 后续以新基准为原点算出的位移会让内容整体错位（少一段却被当作已截到）。
@@ -325,6 +332,7 @@ public sealed class RegionSelectorForm : Form
                 _previous = frame;
                 _accumulator.ResetBaseline();
                 _missStreak = 0;
+                _lastDh = 0;        // 基准换了，上一步位移不再有参考意义
             }
 
             UpdateHud();
@@ -333,6 +341,7 @@ public sealed class RegionSelectorForm : Form
 
         _missStreak = 0;
         _accumulator.Push(frame, dh);
+        _lastDh = dh;
 
         _previous = frame;
         UpdateHud();
