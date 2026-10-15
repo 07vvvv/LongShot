@@ -1,13 +1,35 @@
 namespace LongShot;
 
 /// <summary>
-/// 启动诊断日志。写到临时目录，用户遇到「打不开 / 卡住」时可以直接把这个文件发出来定位。
-/// 每次都追加、只记关键节点（一次启动十来行），不做轮转——真出问题时它自己就是证据。
+/// 启动诊断日志。用户报「打不开 / 卡住」时，这个文件就是唯一的现场。
+///
+/// 落点很关键：以前固定写 %TEMP%，用户根本不知道该去哪儿找，而且临时目录可能被
+/// 重定向、被安全软件清理，出问题的痕迹说没就没。现在优先写 exe 旁边——单文件发布下
+/// 那就是用户双击 exe 的那个目录，一眼可见；只有目录确实写不进去
+/// （Program Files、只读介质、被只读策略保护）才退回 %TEMP%。
 /// </summary>
 internal static class StartLog
 {
-    public static string FilePath { get; } = Path.Combine(
-        Path.GetTempPath(), "LongShot-startup.log");
+    private const long MaxBytes = 512 * 1024;
+
+    /// <summary>日志落点。进程启动时确定一次，之后不再变。</summary>
+    public static string FilePath { get; } = PickFilePath();
+
+    private static string PickFilePath()
+    {
+        var beside = Path.Combine(AppContext.BaseDirectory, "LongShot-startup.log");
+
+        try
+        {
+            // 建得出来不代表写得进去，所以真写一次再认
+            File.AppendAllText(beside, string.Empty);
+            return beside;
+        }
+        catch
+        {
+            return Path.Combine(Path.GetTempPath(), "LongShot-startup.log");
+        }
+    }
 
     public static void Write(string message)
     {
@@ -15,7 +37,7 @@ internal static class StartLog
         {
             // 每次启动都追加，长期用下来别让它无限长大（超上限就重开一份）
             var info = new FileInfo(FilePath);
-            if (info.Exists && info.Length > 512 * 1024) File.Delete(FilePath);
+            if (info.Exists && info.Length > MaxBytes) File.Delete(FilePath);
 
             File.AppendAllText(FilePath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}  {message}{Environment.NewLine}");
         }

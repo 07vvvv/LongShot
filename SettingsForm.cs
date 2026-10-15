@@ -1,4 +1,5 @@
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace LongShot;
@@ -285,9 +286,42 @@ public sealed class SettingsForm : HotkeyHostForm
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
+
+        EnsureOnScreen();
+
         ActiveControl = null;       // 谁也别抢焦点，窗口一出来就是干净的
         StartLog.Write($"窗口已显示，进程创建至今 {StartLog.SinceProcessStart()}");
     }
+
+    /// <summary>
+    /// 把窗口从「快捷方式式启动」里拽出来。
+    ///
+    /// 桌面快捷方式可以设「运行方式：最小化」，Windows 会经 STARTUPINFO.wShowWindow 传
+    /// SW_SHOWMINNOACTIVE；而 Windows 又在进程**第一次** ShowWindow 时拿它覆盖程序自己的请求。
+    /// 结果就是从快捷方式启动时窗口缩在任务栏不肯露面，用户只能认定「打不开」，
+    /// 而进文件夹双击 exe（wShowWindow 正常）一切如常。所以显示之后再校正一次。
+    /// </summary>
+    private void EnsureOnScreen()
+    {
+        if (WindowState == FormWindowState.Minimized)
+        {
+            WindowState = FormWindowState.Normal;
+            StartLog.Write("窗口启动时处于最小化（快捷方式的「运行方式」所致），已恢复正常大小");
+        }
+
+        if (!Visible) Show();
+
+        Activate();
+
+        // 抢前台：Windows 只把前台权限交给当前前台进程，被拒是常态，闪任务栏兜个底
+        if (!SetForegroundWindow(Handle)) FlashWindow(Handle, true);
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool FlashWindow(IntPtr hWnd, bool invert);
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {

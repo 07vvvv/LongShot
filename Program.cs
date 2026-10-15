@@ -30,9 +30,15 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        // 最早的兜底，必须放在第一行：后面的 Application.* 初始化自己也会失败
+        // （单文件发布要先把 native 库解压到临时目录，解压不了就根本起不来），
+        // 那种情况下以前连一个异常处理器都还没注册，用户只能看到「双击了但什么都没发生」。
+        AppDomain.CurrentDomain.UnhandledException += (_, e) => ReportCrash(e.ExceptionObject as Exception, uiThread: false);
+
         var mode = args.FirstOrDefault()?.ToLowerInvariant();
 
         StartLog.Write($"=== 启动 pid={Environment.ProcessId} 模式={mode ?? "ui"} 进程创建至今 {StartLog.SinceProcessStart()}");
+        StartLog.Write($"启动环境 {DescribeLaunchEnvironment()}");
 
         // 自检模式允许并发跑，不参与单实例检测
         if (mode is null && !ClaimSingleInstance())
@@ -54,19 +60,25 @@ internal static class Program
             if (console != IntPtr.Zero) ShowWindow(console, SwHide);
         }
 
-        // 必须最先调用，且在任何窗口创建之前。
-        // 缺了它进程就是 DPI 不感知的：鼠标与窗口用逻辑坐标，而屏幕抓取用物理坐标，
-        // 结果就是「框选的范围」和「实际截到的范围」对不上（125% 缩放下差 1.25 倍）。
-        Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
-
-        Application.EnableVisualStyles();
-        Application.SetCompatibleTextRenderingDefault(false);
-
-        // 全局兜底：绝不让任何漏网异常变成「未经处理的异常」崩溃框。
-        // 记录到启动日志，并给一句人话提示——程序继续跑，用户的截图不至于白截。
-        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
-        Application.ThreadException += (_, e) => ReportCrash(e.Exception, uiThread: true);
-        AppDomain.CurrentDomain.UnhandledException += (_, e) => ReportCrash(e.ExceptionObject as Exception, uiThread: false);
+        try
+        {
+            InitWinForms();
+        }
+        catch (Exception ex)
+        {
+            // 这一段以前是零日志的黑洞：崩在这里时 diag.log 是空的、启动日志也没有记录，
+            // 用户和排查的人都毫无线索。现在至少留下人话提示和现场。
+            StartLog.Write($"!!! 界面初始化失败，程序无法启动：{ex}");
+            ReportCrash(
+                new InvalidOperationException(
+                    "程序启动失败：界面初始化没能完成。\n\n" +
+                    $"详细信息已记录到：\n{StartLog.FilePath}\n\n" +
+                    "若用的是单文件绿色版，通常是临时目录不可写或被杀毒软件拦截了解压——" +
+                    "把程序换个目录（例如 D 盘）再试。",
+                    ex),
+                uiThread: true);
+            return;
+        }
 
         switch (mode)
         {
@@ -108,6 +120,124 @@ internal static class Program
                 return;
         }
     }
+
+    /// <summary>
+    /// WinForms 初始化。单独成方法只为一件事：让 <see cref="Main"/> 能把它整段包进 try，
+    /// 否则这段一崩就是无日志、无提示的全黑。
+    /// </summary>
+    private static void InitWinForms()
+    {
+        // 必须最先调用，且在任何窗口创建之前。
+        // 缺了它进程就是 DPI 不感知的：鼠标与窗口用逻辑坐标，而屏幕抓取用物理坐标，
+        // 结果就是「框选的范围」和「实际截到的范围」对不上（125% 缩放下差 1.25 倍）。
+        Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
+
+        // ⚠️ 这一行必须包起来。EnableVisualStyles 不是「装饰」那么简单：
+        // 它会把一个临时清单文件写进 %TEMP% 再交给 Windows 解析（ThemingScope.
+        // CreateActivationContext）。临时目录被安全软件锁住、被组策略限制、ACL 异常
+        // 或者磁盘写满时，它会直接抛 UnauthorizedAccessException —— 而它以前是裸奔的，
+        // 于是这类机器上程序 100% 起不来，用户只看到「双击了没反应」。
+        // 外观回退成经典样式完全能用，绝不能让它决定程序能不能开。
+        try
+        {
+            Application.EnableVisualStyles();
+        }
+        catch (Exception ex)
+        {
+            StartLog.Write($"!!! 视觉样式启用失败，界面回退为经典外观（功能不受影响）：{ex.Message}");
+        }
+
+        Application.SetCompatibleTextRenderingDefault(false);
+
+        // 全局兜底：绝不让任何漏网异常变成「未经处理的异常」崩溃框。
+        // 记录到启动日志，并给一句人话提示——程序继续跑，用户的截图不至于白截。
+        // 必须在创建任何窗口之前调用，所以放在这里而不是构造函数里。
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (_, e) => ReportCrash(e.Exception, uiThread: true);
+    }
+
+    /// <summary>
+    /// 把「这次是怎么被启动的」记全。
+    ///
+    /// 起因是用户报「桌面快捷方式启动打不开，进文件夹双击 exe 就正常」：
+    /// 两者唯一的系统性差别就在这几个值上（工作目录不同、快捷方式可以塞参数、
+    /// 快捷方式的「运行方式」会走 STARTUPINFO 覆盖窗口显示）。记下来，
+    /// 下次再出现就能一眼看出是哪一种，而不必靠猜。
+    /// </summary>
+    private static string DescribeLaunchEnvironment()
+    {
+        var sb = new StringBuilder();
+
+        sb.Append($"exe={Application.ExecutablePath}");
+        sb.Append($" | 基础目录={AppContext.BaseDirectory}");
+        sb.Append($" | 当前目录={Environment.CurrentDirectory}");
+
+        var extra = Environment.GetCommandLineArgs().Skip(1).ToArray();
+        sb.Append($" | 参数=[{string.Join(' ', extra)}]");
+
+        sb.Append($" | 显示方式={DescribeShowWindow()}");
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 读出 STARTUPINFO 里的显示方式。快捷方式的「运行方式：最小化」就是从这里传进来的，
+    /// 而 Windows 会在进程**第一次** ShowWindow 时用它覆盖程序自己的请求——窗口于是缩进
+    /// 任务栏不露面，用户只能判定为「打不开」。
+    /// </summary>
+    private static string DescribeShowWindow()
+    {
+        try
+        {
+            var si = new StartupInfo { cb = Marshal.SizeOf<StartupInfo>() };
+            GetStartupInfo(ref si);
+
+            if ((si.dwFlags & StartfUseShowWindow) == 0) return "未指定（等同于正常窗口）";
+
+            return si.wShowWindow switch
+            {
+                0 => "SW_HIDE（隐藏）",
+                1 => "SW_SHOWNORMAL（正常）",
+                2 => "SW_SHOWMINIMIZED（最小化）",
+                3 => "SW_SHOWMAXIMIZED（最大化）",
+                6 => "SW_MINIMIZE（最小化）",
+                7 => "SW_SHOWMINNOACTIVE（最小化且不激活）",
+                _ => $"未知（{si.wShowWindow}）",
+            };
+        }
+        catch
+        {
+            return "n/a";
+        }
+    }
+
+    private const int StartfUseShowWindow = 0x1;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct StartupInfo
+    {
+        public int cb;
+        public IntPtr lpReserved;
+        public IntPtr lpDesktop;
+        public IntPtr lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern void GetStartupInfo(ref StartupInfo si);
 
     /// <summary>
     /// 兜底报告。UI 线程上的异常可以就地消化掉并继续运行；
@@ -164,10 +294,19 @@ internal static class Program
 
         // 把已有窗口带到前台：Windows 会拒绝非前台进程的请求，所以多管齐下
         ShowWindow(existing, SwRestore);            // 可能被最小化了
-        SetForegroundWindow(existing);
-        FlashWindow(existing, true);                // 任务栏闪烁，确保用户注意到
 
-        return false;
+        if (SetForegroundWindow(existing))
+        {
+            FlashWindow(existing, true);            // 任务栏闪烁，确保用户注意到
+            return false;
+        }
+
+        // 抢不到前台就绝不硬拦：此时旧窗口可能被别的窗口严实盖住，用户看到的
+        // 就是「点了没反应」——正是这个类要避免的情况。宁可多开一个窗口。
+        // 但要闪一下任务栏，让用户知道「其实已经开着一个」，别以为是重复点了。
+        FlashWindow(existing, true);
+        StartLog.Write("单实例：已有窗口但抢不到前台，本次照常启动（宁可多开）");
+        return true;
     }
 
     private static void MirrorDiagnosticsToFile()

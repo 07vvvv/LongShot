@@ -5,6 +5,7 @@ publish/
 
 # 运行时生成
 diag.log
+LongShot-startup.log
 captures/
 hotkey.json
 
