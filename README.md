@@ -107,6 +107,20 @@ dotnet publish -c Release -r win-x64 --self-contained true `
   -o publish
 ```
 
+## 发布到 GitHub
+
+**双击 `upload-to-github.cmd`** 就行。要指定仓库和标签：
+
+```
+upload-to-github.cmd 你的用户名/LongShot v1.0.1
+```
+
+它会依次：构建 → 打包 zip → 提交源码 → 推送 → 创建 Release（标签已存在则改为覆盖附件，并保留原有说明）。
+
+> 直接双击 `.ps1` 常会失败：带「来自 Internet」标记的脚本会被默认的 `RemoteSigned` 执行策略拒绝，提示「未对文件进行数字签名」。`.cmd` 包装内含 `-ExecutionPolicy Bypass`，所以双击 `.cmd` 即可。
+
+产物布局：源码进仓库（`bin/obj/publish/zip/启动日志` 都在 `.gitignore` 里），Release 附件是 `LongShot-<Tag>-win-x64.zip`（只含 exe）+ 同名 `.sha256`。
+
 ## 已知边界
 
 - **粘性头部 / 固定侧栏**会在长图里重复出现——需要额外的固定区检测，暂未实现。
