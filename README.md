@@ -59,16 +59,17 @@ LongShot.exe --pathtest
 | `--grabtest` | 屏幕抓取在本机是否真能拿到画面 |
 | `--uitest` | 设置界面构造、热键管理器、清除快捷键 |
 | `--pathtest` | 长图输出目录的可写性 |
+| `--logprobe` | 启动日志落点的探测结果与失败原因 |
 | `--startuptest` | 启动耗时 |
 | `--probe` | 探测一批常见组合键在本机是否被占用 |
 | `--makeicon` | 重新生成 `app.ico` |
 | `--uishot` | 抓设置界面和浮层的截图 |
 
-自检输出会镜像到 `diag.log`（GUI 子系统下 stdout 不建立）。
+自检输出会镜像到 `%LOCALAPPDATA%\LongShot\diag.log`（GUI 子系统下 stdout 不建立）。
 
 ## 启动日志
 
-**就在 `LongShot.exe` 旁边**：`LongShot-startup.log`。每次启动追加十来行，是「打不开 / 卡住」时最直接的证据：
+位置固定在 `%LOCALAPPDATA%\LongShot\LongShot-startup.log`（形如 `C:\Users\<你>\AppData\Local\LongShot\LongShot-startup.log`），与热键配置同一个套路——**不往 exe 所在目录写任何东西**，免得 exe 放在桌面或下载目录时在你眼皮底下留杂物。每次启动追加十来行，是「打不开 / 卡住」时最直接的证据：
 
 - 进程创建到各阶段花了多久（`进程创建至今`）
 - **这次是怎么被启动的**：exe 路径、基础目录、当前工作目录、命令行参数、`STARTUPINFO` 里的显示方式
@@ -76,7 +77,15 @@ LongShot.exe --pathtest
 - 配置加载与热键注册结果
 - 窗口最终有没有显示出来
 
-只有 exe 所在目录确实写不进去（`Program Files`、只读介质）时才退回 `%TEMP%`。
+落点是**按优先级探测**的，第一个确实可写的胜出：`%LOCALAPPDATA%\LongShot\` → `%APPDATA%\LongShot\`（与热键配置同目录）→ exe 旁边 → `%TEMP%`。正常机器停在第 1 个；前两个都被企业策略锁死的极端情况才会退到 exe 旁边——总好过「打不开且查无实据」。
+
+想知道这台机器上最终选了哪个、每个候选为什么失败：
+
+```powershell
+LongShot.exe --logprobe
+```
+
+结果写在 exe 旁边的 `_logprobe.txt` 里。
 
 ### 「从快捷方式打不开、进文件夹双击却正常」怎么查
 

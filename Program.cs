@@ -115,10 +115,82 @@ internal static class Program
             case "--pathtest":
                 PathTestRunner.Run();
                 return;
+            case "--logprobe":
+                LogPathProbe();
+                return;
             default:
                 Application.Run(new SettingsForm());
                 return;
         }
+    }
+
+    /// <summary>
+    /// 诊断用：「日志写不出来」时没有任何输出可看，只能靠它把真实路径和失败原因逼出来。
+    /// 结果写到 exe 旁边的 _logprobe.txt（那是唯一已知在受限环境里也能写的位置）。
+    /// </summary>
+    private static void LogPathProbe()
+    {
+        var report = DescribeLogPaths();
+
+        try
+        {
+            File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "_logprobe.txt"), report);
+        }
+        catch
+        {
+            try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "_logprobe.txt"), report); }
+            catch { /* 都写不了就只能放弃 */ }
+        }
+    }
+
+    private static string DescribeLogPaths()
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"BaseDirectory    = {AppContext.BaseDirectory}");
+        sb.AppendLine($"CurrentDirectory = {Environment.CurrentDirectory}");
+        sb.AppendLine($"LocalAppData     = [{Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)}]");
+        sb.AppendLine($"AppData          = [{Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData)}]");
+        sb.AppendLine($"GetTempPath      = [{Path.GetTempPath()}]");
+        sb.AppendLine($"StartLog.Folder  = [{StartLog.Folder}]");
+        sb.AppendLine($"StartLog.FilePath= [{StartLog.FilePath}]");
+        sb.AppendLine();
+
+        var roots = new (string Name, string Path)[]
+        {
+            ("LocalAppData\\LongShot", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LongShot")),
+            ("AppData\\LongShot", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "LongShot")),
+            ("Temp", Path.GetTempPath()),
+            ("exe 旁边", AppContext.BaseDirectory),
+        };
+
+        foreach (var (name, path) in roots)
+        {
+            try
+            {
+                Directory.CreateDirectory(path);
+                var probe = Path.Combine(path, ".probe");
+                File.WriteAllText(probe, "x");
+                File.Delete(probe);
+                sb.AppendLine($"{name}: 完全可写  ({path})");
+            }
+            catch (Exception ex)
+            {
+                sb.AppendLine($"{name}: 失败 {ex.GetType().Name}: {ex.Message}  ({path})");
+            }
+        }
+
+        sb.AppendLine();
+        try
+        {
+            File.AppendAllText(StartLog.FilePath, string.Empty);
+            sb.AppendLine("向 StartLog.FilePath 追加写入: 成功");
+        }
+        catch (Exception ex)
+        {
+            sb.AppendLine($"向 StartLog.FilePath 追加写入: 失败 {ex.GetType().Name}: {ex.Message}");
+        }
+
+        return sb.ToString();
     }
 
     /// <summary>
@@ -315,7 +387,7 @@ internal static class Program
         {
             // 带 BOM：否则读日志的一方会按系统 ANSI 解码，中文全成乱码
             var file = new StreamWriter(
-                Path.Combine(AppContext.BaseDirectory, "diag.log"),
+                Path.Combine(StartLog.Folder, "diag.log"),
                 append: false,
                 new UTF8Encoding(encoderShouldEmitUTF8Identifier: true))
             {

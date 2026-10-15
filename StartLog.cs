@@ -3,32 +3,66 @@ namespace LongShot;
 /// <summary>
 /// 启动诊断日志。用户报「打不开 / 卡住」时，这个文件就是唯一的现场。
 ///
-/// 落点很关键：以前固定写 %TEMP%，用户根本不知道该去哪儿找，而且临时目录可能被
-/// 重定向、被安全软件清理，出问题的痕迹说没就没。现在优先写 exe 旁边——单文件发布下
-/// 那就是用户双击 exe 的那个目录，一眼可见；只有目录确实写不进去
-/// （Program Files、只读介质、被只读策略保护）才退回 %TEMP%。
+/// 落点试过几个极端，都不合适：
+///   - 写 %TEMP%：用户根本不知道该去哪儿找，而且临时目录可能被重定向、被安全软件清理，
+///     出问题的痕迹说没就没。
+///   - 写 exe 旁边：确实一眼可见，但 exe 常被放在桌面或下载目录，等于往用户眼皮底下
+///     扔杂物（实测被用户当场发现）。
+/// 现在改为「本地应用数据优先，逐级兜底」：正常机器上落在
+/// %LOCALAPPDATA%\LongShot\，与热键配置同一个套路，不碰任何 exe 所在目录。
 /// </summary>
 internal static class StartLog
 {
     private const long MaxBytes = 512 * 1024;
 
-    /// <summary>日志落点。进程启动时确定一次，之后不再变。</summary>
-    public static string FilePath { get; } = PickFilePath();
+    /// <summary>日志目录。进程启动时确定一次，之后不再变。</summary>
+    public static string Folder { get; } = PickFolder();
 
-    private static string PickFilePath()
+    /// <summary>启动日志落点。</summary>
+    public static string FilePath { get; } = Path.Combine(Folder, "LongShot-startup.log");
+
+    /// <summary>
+    /// 按优先级挑第一个**确实可写**的目录。
+    ///
+    /// 为什么要逐级兜底：极端受限的机器（企业策略锁掉 AppData、受限账户）里，
+    /// 前两个候选都会失败，此时若直接退到临时目录，日志会被清理机制吃掉，
+    /// 于是「打不开」重新变成查无实据。宁可最后在 exe 旁边留一个文件。
+    /// 正常机器不会走到那一步——只要 %LOCALAPPDATA% 可写就停在那儿。
+    /// </summary>
+    private static string PickFolder()
     {
-        var beside = Path.Combine(AppContext.BaseDirectory, "LongShot-startup.log");
+        var candidates = new List<string>(4);
 
-        try
+        // 取不到路径时 GetFolderPath 会返回空串，Path.Combine("", "x") 会变成相对路径，
+        // 那会把日志写到当前工作目录里去——必须显式挡掉。
+        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (!string.IsNullOrEmpty(local)) candidates.Add(Path.Combine(local, "LongShot"));
+
+        var roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        if (!string.IsNullOrEmpty(roaming)) candidates.Add(Path.Combine(roaming, "LongShot"));
+
+        candidates.Add(AppContext.BaseDirectory);
+
+        foreach (var folder in candidates)
         {
-            // 建得出来不代表写得进去，所以真写一次再认
-            File.AppendAllText(beside, string.Empty);
-            return beside;
+            try
+            {
+                Directory.CreateDirectory(folder);
+
+                // 建得出来不代表写得进去，所以真写一次再认
+                var probe = Path.Combine(folder, ".writable");
+                File.WriteAllText(probe, string.Empty);
+                File.Delete(probe);
+
+                return folder;
+            }
+            catch
+            {
+                // 换下一个候选
+            }
         }
-        catch
-        {
-            return Path.Combine(Path.GetTempPath(), "LongShot-startup.log");
-        }
+
+        return Path.GetTempPath();
     }
 
     public static void Write(string message)
