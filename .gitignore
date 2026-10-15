@@ -1,0 +1,22 @@
+# 构建产物
+bin/
+obj/
+publish/
+
+# 运行时生成
+diag.log
+captures/
+hotkey.json
+
+# 自检产生的临时图
+*-preview.png
+align-fullscreen.png
+pathtest.png
+
+# IDE
+.vs/
+*.user
+
+# 发布压缩包走 Release 附件，不进仓库
+*.zip
+*.sha256

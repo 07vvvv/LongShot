@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- WinExe：双击运行完全不建控制台窗口——它既会挂在设置窗口后面，
+         创建它本身也要花时间（双击时的启动卡顿有一份来自这里）。
+         代价是 GUI 子系统下 stdout 不再建立，所以自检输出会被镜像到 diag.log，
+         见 Program.Main 里的 TeeWriter。 -->
+    <OutputType>WinExe</OutputType>
+    <!-- 用 net10.0 是为了能离线做自包含发布：本机 NuGet 缓存里只有 10.0.12 的
+         win-x64 运行时包，net8.0 需要的 8.0.x 包下不来（网络受限）。 -->
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>LongShot</RootNamespace>
+    <AssemblyName>LongShot</AssemblyName>
+    <SatelliteResourceLanguages>zh-Hans</SatelliteResourceLanguages>
+
+    <!-- 图标由 makeicon 模式生成（见 IconMaker.cs），改图标重跑一次即可 -->
+    <ApplicationIcon>app.ico</ApplicationIcon>
+
+    <!-- 版本信息：显示在 exe 属性 → 详细信息里 -->
+    <Version>1.0.0</Version>
+    <Product>LongShot</Product>
+    <AssemblyTitle>LongShot 滚动截图</AssemblyTitle>
+    <Description>Windows 滚动长截图：按热键框选区域，滚轮滚动内容，左键结束并生成长图。</Description>
+    <Copyright>LongShot</Copyright>
+    <NeutralLanguage>zh-Hans</NeutralLanguage>
+  </PropertyGroup>
+
+</Project>
