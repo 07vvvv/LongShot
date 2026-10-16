@@ -244,6 +244,26 @@ public static class FrameStitcher
     /// <summary>平均灰度差超过它就不信任这次对齐（0–255）。</summary>
     public const double TrustThreshold = 10.0;
 
+    /// <summary>分数差在这个带内就算「并列」：内容周期导致的等价候选，单帧无法分辨。</summary>
+    private const double AmbiguityBand = 0.5;
+
+    /// <summary>
+    /// 低于它就不必再校验峰形：分数已经这么低，说明内容几乎逐像素对上了。
+    /// 实测两端：噪声主导的真匹配最高到 5.70（σ=8 的帧间抖动），超出可检测范围的伪匹配最低 7.34，
+    /// 中间这段空隙就是这个阈值的容身之处。刻意不做「差值/信噪比」式的自适应判据——实测
+    /// 低对比度内容的行间差（±3，错开一行只差 1.3）比伪匹配的（纹理错开一行差 6.5）还小，
+    /// 两个方向都会翻车，只能靠绝对分数的空隙来分。
+    /// 代价说清楚：噪声比 σ=8 还大时（分数越过这里）会被判成伪匹配而丢帧——丢内容不写错位置。
+    /// </summary>
+    private const double PeakCheckFloor = 6.0;
+
+    /// <summary>
+    /// 「平峰」的差值口径：邻居比最优高出不到这么多，就算压根没比最优差。
+    /// 与倍数口径互补——倍数对「分数量级大、纹理稀疏」的内容失灵（最优 3.69 时要求邻居 > 7.38），
+    /// 差值对这种内容有效；反过来倍数对纹理密集的内容更灵敏。两条任一成立就判失败。
+    /// </summary>
+    private const double FlatGap = 1.0;
+
     /// <summary>低于它就认为画面根本没动（用户没滚）。</summary>
     private const double StillThreshold = 1.0;
 
@@ -418,6 +438,7 @@ public static class FrameStitcher
 
         var best = 0;
         var bestScore = double.MaxValue;
+        var refined = new List<(int Dh, double Score)>(CoarseTopK * 5);
 
         foreach (var (seed, _) in coarse.Take(CoarseTopK))
         {
@@ -427,11 +448,53 @@ public static class FrameStitcher
             {
                 if (Math.Abs(candidate) < 4) continue;
                 var s = NormalizedSad(prev, next, w, h, candidate, 1, moving);
+                refined.Add((candidate, s));
+
                 if (s < bestScore)
                 {
                     bestScore = s;
                     best = candidate;
                 }
+            }
+        }
+
+        // 并列：内容有周期（重复卡片、缩略图、相同文案的条目、骨架屏）时，差一个周期的候选
+        // 分数完全相同，单帧根本无法分辨方向。唯一的证据是「上一步位移本身也在这个并列集合里」
+        // ——连续滚动时它正是真值附近的值。拿不到这个证据就别猜：少一段内容，总好过把内容接到
+        // 长图的另一端（顺序颠倒 + 重复），后者正是用户报的故障。
+        var peers = 0;
+        var hintIsPeer = false;
+
+        foreach (var (candidate, s) in refined)
+        {
+            if (s > bestScore + AmbiguityBand) continue;
+
+            // 上一步位移本身也在并列集合里（它可能就是 best，也可能是差一个周期的另一个候选）
+            if (hint != 0 && Math.Abs(candidate - hint) <= 2) hintIsPeer = true;
+
+            if (Math.Abs(candidate - best) > 2) peers++;
+        }
+
+        if (peers > 0 && !hintIsPeer) return (false, best, bestScore);
+
+        // 峰形：真实位移超出可检测范围（单帧位移大于 h - h/8，两帧几乎不重叠）时，范围内只剩
+        // 「碰巧有点像」的候选，其中最好的那个分数也不高——旧版直接采信它，把新内容接到长图的
+        // 错误位置。这种伪匹配的峰是平的：最优与相邻位移的分数差不多；真实匹配则一枝独秀，
+        // 错开一行就明显对不上。绝对分数不能用来判（实测伪匹配低到 7.34，低于任何敢用的阈值），
+        // 但「邻居至少差一倍」是无量纲的，内容稀疏也不受影响。
+        //
+        // 分数已经很低时整段跳过：低对比度内容（视频、大面积渐变、浅灰骨架屏）配上帧间抖动，
+        // 错开一行与正对上的分数本来就差不多，硬校验峰形会把它误判成伪匹配——那本来是能对上的
+        // 内容。顺带把两次全帧 SAD 也省掉了，1920×1000 上约 40ms，而抓帧间隔只有 200ms。
+        if (bestScore > PeakCheckFloor)
+        {
+            var left = NormalizedSad(prev, next, w, h, best - 1, 4, moving);
+            var right = NormalizedSad(prev, next, w, h, best + 1, 4, moving);
+
+            if (left < bestScore * 2 || right < bestScore * 2
+                || left - bestScore < FlatGap || right - bestScore < FlatGap)
+            {
+                return (false, best, bestScore);
             }
         }
 
@@ -508,7 +571,6 @@ public sealed class ScrollAccumulator
     private readonly List<int[]> _headBlocks = [];      // 首帧上方，越靠后越靠上
     private readonly List<int[]> _tailBlocks = [];      // 首帧下方，越靠后越靠下
     private int[] _first = [];
-    private bool _allowPrepend = true;
 
     public int Width { get; private set; }
     public int Height { get; private set; }
@@ -576,7 +638,7 @@ public sealed class ScrollAccumulator
             Segments++;
             added = true;
         }
-        else if (_allowPrepend && next < MinCursor)
+        else if (next < MinCursor)
         {
             // 向上滚出新内容：新帧开头那几行
             var count = Math.Min(MinCursor - next, frame.Height);
@@ -600,14 +662,14 @@ public sealed class ScrollAccumulator
     }
 
     /// <summary>
-    /// 基准失效（连续多帧都配不上）时重设：把当前位置当成新的底部，
-    /// 之后的内容一律接在尾部，不再接受向上前插——允许结果里出现一次可见的跳跃，
-    /// 总好过因为永远配不上而彻底卡死。
+    /// 基准失效（连续多帧都配不上）时重设：把当前位置当成已截内容的底部，之后的内容一律接在尾部。
+    /// 刻意**不**关掉向上前插：用户很可能正一路往上滚，之后的内容必须还能拼到长图上方。
+    /// 这样长图从上到下的顺序始终是对的，代价只是位置可能有一次可见的偏移——顺序错乱
+    /// （内容接到长图的另一端、同一段重复出现）比位置偏一点严重得多，那正是用户报的故障。
     /// </summary>
     public void ResetBaseline()
     {
         Cursor = MaxCursor;
-        _allowPrepend = false;
     }
 
     /// <summary>

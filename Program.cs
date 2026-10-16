@@ -883,7 +883,9 @@ internal static class StitchTestRunner
         }
 
         {
-            // 基准重设后：内容一律接尾部，且不再向上前插（前插会拼到错误位置）
+            // 基准重设后位置已经跟丢了，但**顺序**必须保持：用户很可能正一路往上滚，
+            // 之后的内容要能正确拼到长图上方。关掉前插会让页面靠上的内容全被接到尾部，
+            // 长图整体颠倒——正是用户报的故障形态。
             total++;
             var page = FakePage(200, 2000);
             var acc = new ScrollAccumulator();
@@ -895,8 +897,11 @@ internal static class StitchTestRunner
 
             using var bmp = acc.BuildBitmap();
             var rowCount = bmp.Height;
-            var ok = tail && !prepended && rowCount == 500;
-            Console.WriteLine($"  [基准重设] 行数 {rowCount}（期望 500）　接尾部={tail}　向上不前插={!prepended}　{(ok ? "PASS" : "FAIL")}");
+            var contentOk = ContentMatches(bmp, page, 500 + acc.MinCursor);
+            var ok = tail && prepended && rowCount == 600 && acc.MinCursor == -100 && contentOk;
+
+            Console.WriteLine($"  [基准重设] 行数 {rowCount}（期望 600）　接尾部={tail}　向上前插={prepended}　" +
+                              $"内容对齐={contentOk}　{(ok ? "PASS" : "FAIL")}");
             if (ok) pass++;
         }
 
@@ -977,15 +982,126 @@ internal static class StitchTestRunner
 
         {
             // 严格周期内容 + 没有上一步位移（首帧、或刚重设过基准）：差一个周期的候选在数学上
-            // 完全等价，任何算法都分辨不了——所以这里只要求「给出的是一个内容真的对得上的位移」，
-            // 不要求它恰好等于真值。
+            // 完全等价，单帧根本分辨不了方向。所以这里要的是「给出的是一个内容真的对得上的位移，
+            // 或者干脆明确说未确定」——绝不允许随便挑一个方向写进长图（那正是顺序颠倒的来源）。
             total++;
             var card = FakePage(200, 150);
             var page = Tile(card, 8);
             var prev = Slice(page, 0, 300);
             var next = Slice(page, 100, 300);
-            var ok = FrameStitcher.TryEstimateOffset(prev, next, out var got, out var score, 0) && score <= 1.0;
-            Console.WriteLine($"  [无先验  ] 周期 150、不给上一步位移　实测 dh={got,4}　score={score,6:F2}　对得上={score <= 1.0}　{(ok ? "PASS" : "FAIL")}");
+
+            var found = FrameStitcher.TryEstimateOffset(prev, next, out var got, out var score, 0);
+            var ok = !found || score <= 1.0;
+
+            Console.WriteLine($"  [无先验  ] 周期 150、不给上一步位移　" +
+                              $"{(found ? $"实测 dh={got,4}　score={score,6:F2}" : "判为未确定（不猜方向）")}　{(ok ? "PASS" : "FAIL")}");
+            if (ok) pass++;
+        }
+
+        {
+            // 反向滚动端到端：用户从页面底部一路往上滚（dh 为负），长图必须仍是页面从上到下的
+            // 顺序——页面靠下的内容接在下方。每帧都走真实配准拿 dh 再进真实累积器，最后逐行
+            // 比对长图与页面：顺序一旦颠倒或重复，比对立刻失败。
+            // 必须覆盖 GrabOnceCore 的 hint 路径：首帧之后还没有「上一步位移」（hint=0），
+            // 以及滚动中间手一停（dh=0，hint 被清零）——正是这两处最容易被周期内容骗到。
+            foreach (var (kind, step, pause, note, strict) in new (string, int, bool, string, bool)[]
+            {
+                ("tile48", -100, false, "反向·周期 48", true),
+                ("tile48", -100, true, "反向·周期 48 + 停顿", true),
+                ("sparse16", -100, true, "反向·行结构 16 + 停顿", false),
+                ("fake", -100, true, "反向·无周期 + 停顿", false),
+                ("tile48", -96, true, "反向·周期 48、步长 96", true),
+                ("fake", 100, true, "正向·无周期 + 停顿", false),
+                ("sparse16", 100, true, "正向·行结构 16 + 停顿", false),
+                ("tile48", 100, true, "正向·周期 48 + 停顿", true),
+            })
+            {
+                total++;
+
+                var page = kind switch
+                {
+                    "tile48" => Tile(FakePage(200, 48), 63),
+                    "sparse16" => SparsePage(200, 3000, 16),
+                    _ => FakePage(200, 3000),
+                };
+
+                var steps = new List<int>();
+                for (var i = 0; i < 10; i++)
+                {
+                    steps.Add(step);
+                    if (pause) steps.Add(0);       // 手停：同一帧再来一次
+                }
+
+                // 向下滚只动尾部，向上滚才前插，所以「内容坐标最上端」只有反向滚动才会变负
+                var expectedMin = step < 0 ? step * 10 : 0;
+                var expectedRows = 300 + (step < 0 ? -expectedMin : step * 10);
+                var startTop = step < 0 ? 1500 : 500;
+
+                var (min, rows, contentOk) = ReverseScroll(page, startTop, 300, steps.ToArray());
+
+                // 严格周期内容是数学边界：差一个周期的候选分数完全相同，方向不可分辨。
+                // 这种内容只要求「长图仍是页面的连续切片，没有接反也没有重复」——
+                // 宁可少一段，也绝不能把页面靠上的内容接到长图尾部。
+                var ok = strict
+                    ? contentOk && min <= 0 && min >= expectedMin
+                    : min == expectedMin && rows == expectedRows && contentOk;
+
+                Console.WriteLine($"  [反向滚动] {note,-18}　min={min,6}（期望 {expectedMin}）　" +
+                                  $"行数={rows,5}（期望 {expectedRows}）　内容对齐={contentOk}　{(ok ? "PASS" : "FAIL")}");
+                if (ok) pass++;
+            }
+        }
+
+        {
+            // 低对比度内容 + 帧间抖动（视频、大面积渐变、亚像素渲染变化）：错开一行与正对上的
+            // 分数本来就差不多，峰形判据会把它误当成伪匹配。这种内容本来是能对上的，不能丢。
+            foreach (var sigma in new[] { 0, 2, 8 })
+            {
+                total++;
+                var page = LowContrastPage(200, 1400);
+                var prev = AddNoise(Slice(page, 0, 300), sigma, 11);
+                var next = AddNoise(Slice(page, 100, 300), sigma, 22);
+
+                var ok = FrameStitcher.TryEstimateOffset(prev, next, out var got, out var score) && got == 100;
+                Console.WriteLine($"  [低对比度] 帧间噪声 σ={sigma}　期望 dh= 100　实测 dh={got,4}　" +
+                                  $"score={score,6:F2}　{(ok ? "PASS" : "FAIL")}");
+                if (ok) pass++;
+            }
+        }
+
+        {
+            // 首帧回退：用户先往下滚一屏多，再快速往回滚。相邻两帧毫无重叠（-600 超过可检测
+            // 上限 0.875h），但当前帧与首帧还有重叠——直接跟首帧对就能把绝对坐标一次性拿回来。
+            total++;
+            var page = FakePage(200, 4000);
+            var steps = new List<int>();
+            for (var i = 0; i < 5; i++) { steps.Add(100); steps.Add(0); }
+            steps.Add(-600); steps.Add(0);
+            for (var i = 0; i < 2; i++) { steps.Add(-100); steps.Add(0); }
+
+            var (min, rows, contentOk) = ReverseScroll(page, 1000, 300, steps.ToArray());
+            var ok = min == -300 && rows == 1100 && contentOk;
+
+            Console.WriteLine($"  [首帧回退] min={min,6}（期望 -300）　行数={rows,5}（期望 1100）　" +
+                              $"内容对齐={contentOk}　{(ok ? "PASS" : "FAIL")}");
+            if (ok) pass++;
+        }
+
+        {
+            // 位移超过可检测上限（单帧大于 h - h/8 ≈ 0.875h）时相邻两帧毫无重叠，配准在数学上
+            // 不可能，内容只能丢——这里唯一的要求是「长图仍是页面的连续切片」：可以少内容，
+            // 绝不能把内容接到错误位置（旧版会把伪匹配当成真匹配采信，正是用户报的顺序颠倒）。
+            total++;
+            var page = SparsePage(200, 4000, 24);
+            var steps = new List<int>();
+            for (var i = 0; i < 4; i++) { steps.Add(-400); steps.Add(0); }
+            for (var i = 0; i < 6; i++) { steps.Add(-150); steps.Add(0); }
+
+            var (min, rows, contentOk) = ReverseScroll(page, 2500, 300, steps.ToArray(), rebaseline: true);
+            var ok = contentOk;
+
+            Console.WriteLine($"  [反向大跳] min={min,6}　行数={rows,5}　内容对齐={contentOk}" +
+                              "（可少不可错）　" + (ok ? "PASS" : "FAIL"));
             if (ok) pass++;
         }
 
@@ -1088,6 +1204,141 @@ internal static class StitchTestRunner
         }
 
         return new ScreenFrame { Width = w, Height = card.Height * count, Gray = gray, Pixels = pixels };
+    }
+
+    /// <summary>
+    /// 反向滚动端到端：按给定步长序列在 page 上滑窗，每帧先过真实配准拿 dh、再进真实累积器
+    /// （hint 的传递与清零完全复刻 RegionSelectorForm.GrabOnceCore），最后回报累积器的内容坐标。
+    /// 步长为 0 表示用户这一拍手停：配准会给出 dh=0，hint 随之归零。
+    /// </summary>
+    private static (int MinCursor, int Rows, bool ContentOk) ReverseScroll(
+        ScreenFrame page, int startTop, int frameHeight, int[] steps, bool rebaseline = false, bool trace = false)
+    {
+        var acc = new ScrollAccumulator();
+        var top = startTop;
+        var first = Slice(page, top, frameHeight);
+        acc.AddFirstFrame(first);
+
+        var prev = first;
+        var lastDh = 0;                         // 首帧之后还没有「上一步位移」
+        var missStreak = 0;
+
+        if (trace) Console.WriteLine($"    top={top,5}　首帧");
+
+        foreach (var step in steps)
+        {
+            top += step;
+            var frame = Slice(page, top, frameHeight);
+
+            if (!FrameStitcher.TryEstimateOffset(prev, frame, out var dh, out var sc, lastDh)
+                && !TryRealign(first, frame, acc, out dh, out sc))
+            {
+                missStreak++;
+                if (trace) Console.WriteLine($"    top={top,5}　step={step,5}　hint={lastDh,5}　配准失败　miss={missStreak}");
+
+                // 与 RegionSelectorForm.GrabOnceCore 一致：一帧配不上先保留旧基准，
+                // 连续 5 帧配不上才重设基准
+                if (rebaseline && missStreak >= 5)
+                {
+                    prev = frame;
+                    acc.ResetBaseline();
+                    missStreak = 0;
+                    lastDh = 0;
+                    if (trace) Console.WriteLine("    ── 基准重设 ──");
+                }
+
+                continue;
+            }
+
+            missStreak = 0;
+            var pushed = acc.Push(frame, dh);
+            if (dh != 0) lastDh = dh;           // 停手时 dh=0，hint 不清零
+
+            if (trace)
+            {
+                Console.WriteLine($"    top={top,5}　step={step,5}　hint={lastDh,5}　dh={dh,5}　" +
+                                  $"score={sc,6:F2}　push={pushed}　cursor={acc.Cursor}　min/max={acc.MinCursor}/{acc.MaxCursor}　rows={acc.Rows}");
+            }
+
+            prev = frame;
+        }
+
+        using var bmp = acc.BuildBitmap();
+        return (acc.MinCursor, acc.Rows, ContentMatches(bmp, page, startTop + acc.MinCursor));
+    }
+
+    /// <summary>与 RegionSelectorForm.TryRealignToFirst 一致：跟首帧直接对，换回绝对坐标。</summary>
+    private static bool TryRealign(
+        ScreenFrame first, ScreenFrame frame, ScrollAccumulator acc, out int dh, out double score)
+    {
+        dh = 0;
+        score = 0;
+
+        if (!FrameStitcher.TryEstimateOffset(first, frame, out var absolute, out score)) return false;
+
+        dh = absolute - acc.Cursor;
+        return dh != 0;
+    }
+
+    /// <summary>低对比度页面：行底色逐行独立起伏 ±3（视频、大面积渐变、浅色表格、浅灰骨架屏）。</summary>
+    private static ScreenFrame LowContrastPage(int w, int h)
+    {
+        var pixels = new int[w * h];
+        var gray = new byte[w * h];
+        var rnd = new Random(3);
+
+        for (var y = 0; y < h; y++)
+        {
+            var row = 150 + rnd.Next(-3, 4);
+
+            for (var x = 0; x < w; x++)
+            {
+                var v = (byte)Math.Clamp(row + rnd.Next(0, 2), 0, 255);
+                gray[y * w + x] = v;
+                pixels[y * w + x] = unchecked((int)0xFF000000 | (v << 16) | (v << 8) | v);
+            }
+        }
+
+        return new ScreenFrame { Width = w, Height = h, Gray = gray, Pixels = pixels };
+    }
+
+    /// <summary>叠加独立的帧间抖动，模拟渲染差异 / 亚像素变化 / 视频噪声。</summary>
+    private static ScreenFrame AddNoise(ScreenFrame frame, int sigma, int seed)
+    {
+        if (sigma <= 0) return frame;
+
+        var size = frame.Gray.Length;
+        var gray = new byte[size];
+        var pixels = new int[size];
+        var rnd = new Random(seed);
+
+        for (var i = 0; i < size; i++)
+        {
+            // 两个均匀分布相加近似正态，省一次浮点开方
+            var delta = (rnd.Next(-sigma, sigma + 1) + rnd.Next(-sigma, sigma + 1)) / 2;
+            var v = (byte)Math.Clamp(frame.Gray[i] + delta, 0, 255);
+            gray[i] = v;
+            pixels[i] = unchecked((int)0xFF000000 | (v << 16) | (v << 8) | v);
+        }
+
+        return new ScreenFrame { Width = frame.Width, Height = frame.Height, Gray = gray, Pixels = pixels };
+    }
+
+    /// <summary>长图每一行是否都等于页面从 pageTop 起的对应行（顺序颠倒或重复都会露馅）。</summary>
+    private static bool ContentMatches(Bitmap bmp, ScreenFrame page, int pageTop)
+    {
+        var w = page.Width;
+        if (pageTop < 0 || pageTop + bmp.Height > page.Height) return false;
+
+        for (var y = 0; y < bmp.Height; y++)
+        {
+            for (var x = 0; x < w; x += 7)
+            {
+                if (bmp.GetPixel(x, y).ToArgb() != page.Pixels[(pageTop + y) * w + x]) return false;
+            }
+        }
+
+        return true;
     }
 }
 

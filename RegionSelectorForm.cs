@@ -41,6 +41,7 @@ public sealed class RegionSelectorForm : Form
     private bool _hudOverlapsSelection;
 
     private ScreenFrame? _previous;
+    private ScreenFrame? _first;
     private readonly ScrollAccumulator _accumulator = new();
     private int _skipped;
     private int _missStreak;
@@ -314,11 +315,13 @@ public sealed class RegionSelectorForm : Form
         {
             _accumulator.AddFirstFrame(frame);
             _previous = frame;
+            _first = frame;
             UpdateHud();
             return;
         }
 
-        if (!FrameStitcher.TryEstimateOffset(_previous, frame, out var dh, out _, _lastDh))
+        if (!FrameStitcher.TryEstimateOffset(_previous, frame, out var dh, out _, _lastDh)
+            && !TryRealignToFirst(frame, out dh))
         {
             // 基准失效时不能顺手把当前帧当成新基准：累积器的游标还停在旧位置，
             // 后续以新基准为原点算出的位移会让内容整体错位（少一段却被当作已截到）。
@@ -341,10 +344,27 @@ public sealed class RegionSelectorForm : Form
 
         _missStreak = 0;
         _accumulator.Push(frame, dh);
-        _lastDh = dh;
+        if (dh != 0) _lastDh = dh;      // 停手（dh=0）时不清零：下一帧还要靠它分辨周期内容的真假峰
 
         _previous = frame;
         UpdateHud();
+    }
+
+    /// <summary>
+    /// 与上一帧对不上时的退路：直接跟首帧对。用户一次滚得比一屏还多时相邻两帧毫无重叠，
+    /// 配准在数学上不可能，但当前帧往往还与首帧有重叠——对上了就能把「当前帧在内容坐标里的
+    /// 绝对位置」一次性拿回来（dh 换算成相对上一帧的位移），比让累积器的游标停在旧位置继续
+    /// 往前滚要准得多。
+    /// </summary>
+    private bool TryRealignToFirst(ScreenFrame frame, out int dh)
+    {
+        dh = 0;
+
+        if (_first is null) return false;
+        if (!FrameStitcher.TryEstimateOffset(_first, frame, out var absolute, out _)) return false;
+
+        dh = absolute - _accumulator.Cursor;
+        return dh != 0;
     }
 
     private void UpdateHud() =>
